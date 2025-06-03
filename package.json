@@ -1,0 +1,25 @@
+{
+  "name": "quackademic-excellence-discord-bot",
+  "version": "1.0.0",
+  "description": "A modern, branded Discord bot for the 333rd Mad Ducks, built by zevinDev.",
+  "type": "module",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "bun src/bot.js",
+    "test": "bun test"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.5",
+    "puppeteer": "^24.10.0"
+  },
+  "devDependencies": {},
+  "bun": {
+    "test": {
+      "coverage": true
+    }
+  }
+}
