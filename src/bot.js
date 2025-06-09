@@ -5,8 +5,7 @@ import { Client, GatewayIntentBits, Events } from 'discord.js';
 import dotenv from 'dotenv';
 import { getDropdownItems, getContentForDropdownItem } from './scraper.js';
 import puppeteer from 'puppeteer';
-import fs from 'fs/promises';
-import path from 'path';
+import { MongoClient } from 'mongodb';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -30,20 +29,14 @@ export const startBot = async () => {
   let page = null;
   let dropdownItems = [];
 
-  async function launchOrRefreshBrowser() {
-    if (browser) {
-      try {
-        await browser.close();
-        console.log('[Puppeteer] Closed previous browser instance.');
-      } catch (e) {
-        console.warn('[Puppeteer] Error closing previous browser:', e);
-      }
+  // --- LAUNCH BROWSER AND PAGE ONCE AT STARTUP ---
+  async function launchBrowserAndPage() {
+    if (!browser) {
+      const puppeteerArgs = process.env.NODE_ENV === 'production' ? ['--no-sandbox', '--disable-setuid-sandbox'] : [];
+      console.log('[Puppeteer] Launching browser...');
+      browser = await puppeteer.launch({ headless: true, args: puppeteerArgs });
+      page = await browser.newPage();
     }
-    // Use --no-sandbox in production/Docker
-    const puppeteerArgs = process.env.NODE_ENV === 'production' ? ['--no-sandbox', '--disable-setuid-sandbox'] : [];
-    console.log('[Puppeteer] Launching browser...');
-    browser = await puppeteer.launch({ headless: true, args: puppeteerArgs });
-    page = await browser.newPage();
     const formUrl = process.env.FORM_LINK;
     console.log('[Puppeteer] Navigating to:', formUrl);
     try {
@@ -59,26 +52,51 @@ export const startBot = async () => {
     }
   }
 
-  // --- CACHE SYSTEM FOR DROPDOWN CONTENT ---
-  const cacheDir = path.resolve('./cache');
-  async function ensureCacheDir() {
-    try { await fs.mkdir(cacheDir, { recursive: true }); } catch {}
-  }
-  function normalizeDropdownName(name) {
-    return name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').replace(/_+/g, '_').slice(0, 32);
-  }
-  async function writeDropdownCache(item, content) {
-    const file = path.join(cacheDir, normalizeDropdownName(item) + '.txt');
-    await fs.writeFile(file, content, 'utf8');
-  }
-  async function readDropdownCache(item) {
-    const file = path.join(cacheDir, normalizeDropdownName(item) + '.txt');
-    try { return await fs.readFile(file, 'utf8'); } catch { return ''; }
+  // --- REFRESH PAGE AND UPDATE CACHE AT INTERVAL ---
+  async function refreshPageAndUpdateCache() {
+    if (!browser || !page) {
+      await launchBrowserAndPage();
+      return;
+    }
+    try {
+      await page.reload({ waitUntil: 'networkidle2' });
+      dropdownItems = await getDropdownItems(page);
+      console.log(`[Puppeteer] Refreshed and scraped ${dropdownItems.length} dropdown items.`);
+      if (dropdownItems.length === 0) {
+        console.warn('[Puppeteer] No dropdown items found after refresh!');
+      }
+    } catch (err) {
+      console.error('[Puppeteer] Error during page refresh or scraping:', err);
+      dropdownItems = [];
+    }
+    await updateAllDropdownCache();
   }
 
-  // Update all dropdown cache files
+  // --- MONGODB CONNECTION ---
+  const mongoUri = process.env.MONGODB_URI;
+  if (!mongoUri) throw new Error('Missing MONGODB_URI in environment variables.');
+  const mongoClient = new MongoClient(mongoUri);
+  await mongoClient.connect();
+  const db = mongoClient.db();
+  const dropdownCacheCol = db.collection('dropdownCache');
+  const guildSettingsCol = db.collection('guildSettings');
+  const lastSentContentCol = db.collection('lastSentContent');
+
+  // --- CACHE SYSTEM FOR DROPDOWN CONTENT (MongoDB) ---
+  async function writeDropdownCache(item, content) {
+    await dropdownCacheCol.updateOne(
+      { item },
+      { $set: { item, content } },
+      { upsert: true }
+    );
+  }
+  async function readDropdownCache(item) {
+    const doc = await dropdownCacheCol.findOne({ item });
+    return doc?.content || '';
+  }
+
+  // Update all dropdown cache files (MongoDB)
   async function updateAllDropdownCache() {
-    await ensureCacheDir();
     for (const item of dropdownItems) {
       try {
         const content = await getContentForDropdownItem(page, item);
@@ -87,64 +105,75 @@ export const startBot = async () => {
     }
   }
 
+  // --- SETTINGS SYSTEM (MongoDB) ---
+  // In-memory settings per guild: { [guildId]: { pages: Set<string>, roles: { [page]: Set<roleId> }, channel: channelId } }
+  const guildSettings = {};
+
+  // Load settings from MongoDB at startup
+  const allSettings = await guildSettingsCol.find().toArray();
+  for (const doc of allSettings) {
+    guildSettings[doc.guildId] = {
+      pages: new Set(doc.pages),
+      roles: Object.fromEntries(
+        Object.entries(doc.roles || {}).map(([page, roles]) => [page, new Set(roles)])
+      ),
+      channel: doc.channel ?? null,
+    };
+  }
+
+  // Helper: persist settings to MongoDB
+  async function saveSettings() {
+    for (const [guildId, settings] of Object.entries(guildSettings)) {
+      await guildSettingsCol.updateOne(
+        { guildId },
+        {
+          $set: {
+            guildId,
+            pages: Array.from(settings.pages),
+            roles: Object.fromEntries(
+              Object.entries(settings.roles || {}).map(([page, roles]) => [page, Array.from(roles)])
+            ),
+            channel: settings.channel ?? null,
+          },
+        },
+        { upsert: true }
+      );
+    }
+  }
+
+  // --- LAST SENT CONTENT SYSTEM (MongoDB) ---
+  // In-memory cache: { [guildId]: { [pageName]: lastContentString } }
+  const lastSentContent = {};
+  const allLastSent = await lastSentContentCol.find().toArray();
+  for (const doc of allLastSent) {
+    lastSentContent[doc.guildId] = { ...doc.pages };
+  }
+  async function saveLastSentContent() {
+    for (const [guildId, pages] of Object.entries(lastSentContent)) {
+      await lastSentContentCol.updateOne(
+        { guildId },
+        { $set: { guildId, pages } },
+        { upsert: true }
+      );
+    }
+  }
+
   // Launch browser, load dropdown items, and cache at startup
   try {
-    await launchOrRefreshBrowser();
+    await launchBrowserAndPage();
     await updateAllDropdownCache();
   } catch (err) {
     console.error('[Startup] Error during initial browser launch or cache update:', err);
   }
 
-  // Refresh browser, dropdown items, and cache every 5 minutes
+  // Refresh page, dropdown items, and cache every 5 minutes
   setInterval(async () => {
     try {
-      await launchOrRefreshBrowser();
-      await updateAllDropdownCache();
+      await refreshPageAndUpdateCache();
     } catch (err) {
-      console.error('[Interval] Error during browser refresh or cache update:', err);
+      console.error('[Interval] Error during page refresh or cache update:', err);
     }
   }, 5 * 60 * 1000);
-
-  // --- SETTINGS SYSTEM ---
-  // In-memory settings per guild: { [guildId]: { pages: Set<string>, roles: { [page]: Set<roleId> }, channel: channelId } }
-  const guildSettings = {};
-  const settingsFile = path.resolve('./guildSettings.json');
-
-  // Load settings from file at startup
-  try {
-    const data = await fs.readFile(settingsFile, 'utf8');
-    const raw = JSON.parse(data);
-    for (const [guildId, settings] of Object.entries(raw)) {
-      guildSettings[guildId] = {
-        pages: new Set(settings.pages),
-        roles: Object.fromEntries(
-          Object.entries(settings.roles || {}).map(([page, roles]) => [page, new Set(roles)])
-        ),
-        channel: settings.channel ?? null,
-      };
-    }
-  } catch (err) {
-    // silent fail
-  }
-
-  // Helper: persist settings to file
-  async function saveSettings() {
-    const serializable = {};
-    for (const [guildId, settings] of Object.entries(guildSettings)) {
-      serializable[guildId] = {
-        pages: Array.from(settings.pages),
-        roles: Object.fromEntries(
-          Object.entries(settings.roles || {}).map(([page, roles]) => [page, Array.from(roles)])
-        ),
-        channel: settings.channel ?? null,
-      };
-    }
-    try {
-      await fs.writeFile(settingsFile, JSON.stringify(serializable, null, 2), 'utf8');
-    } catch (err) {
-      // silent fail
-    }
-  }
 
   // Helper: check if user is guild admin or owner
   function isGuildAdminOrOwner(interaction) {
@@ -410,9 +439,7 @@ export const startBot = async () => {
     }
   });
 
-  // --- BACKGROUND NOTIFICATION JOB ---
-  // Every 5 minutes, check for updates and send notifications if content changes
-  setInterval(async () => {
+  async function runNotificationJob() {
     for (const [guildId, settings] of Object.entries(guildSettings)) {
       if (!settings.channel || !settings.pages || settings.pages.size === 0) continue;
       const guild = client.guilds.cache.get(guildId);
@@ -471,7 +498,46 @@ export const startBot = async () => {
         }
       }
     }
-  }, 5 * 60 * 1000);
+  }
+
+  // Scheduler: check every minute if it's a scheduled time in Central Time, and run the job if so
+  let lastMinuteChecked = null;
+  function getCentralTimeParts(date = new Date()) {
+    // Use Intl.DateTimeFormat to get hour and minute in America/Chicago
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Chicago',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+    const parts = fmt.formatToParts(date);
+    const hour = parseInt(parts.find(p => p.type === 'hour').value, 10);
+    const minute = parseInt(parts.find(p => p.type === 'minute').value, 10);
+    return { hour, minute };
+  }
+
+  async function notificationScheduler() {
+    const now = new Date();
+    const { hour, minute } = getCentralTimeParts(now);
+    const nowMinutes = hour * 60 + minute;
+    // Allowed times: 15:33, 16:03, 16:33, ..., 22:00 (Central Time)
+    let allowed = false;
+    let t = 15 * 60 + 33;
+    while (t <= 22 * 60) {
+      if (nowMinutes === t) {
+        allowed = true;
+        break;
+      }
+      t += 30;
+    }
+    if (allowed && lastMinuteChecked !== nowMinutes) {
+      console.log(`[Scheduler] Running notification job at ${hour}:${minute} (Central Time)`);
+      await runNotificationJob();
+      lastMinuteChecked = nowMinutes;
+    }
+    setTimeout(notificationScheduler, 60 * 1000 - (now.getSeconds() * 1000 + now.getMilliseconds()));
+  }
+  notificationScheduler();
 
   // Log environment variables at startup (do not log secrets)
   console.log('[Env] DISCORD_TOKEN loaded:', !!process.env.DISCORD_TOKEN ? 'yes' : 'no');
@@ -500,36 +566,24 @@ export const startBot = async () => {
     process.exit(0);
   });
 
+  // Add process exit diagnostics
+  process.on('exit', (code) => {
+    console.error(`[Process] exit event: code=${code}`);
+  });
+  process.on('beforeExit', (code) => {
+    console.error(`[Process] beforeExit event: code=${code}`);
+  });
+
+  // Add a log at the end of startBot to confirm the bot is running
+  console.log('[Bot] startBot function completed, bot should be running.');
+
   return client;
 };
 
 // Start the bot if this file is run directly
 if (import.meta.main) {
-  startBot().catch(() => {
+  startBot().catch((err) => {
+    console.error('[Fatal] startBot() failed:', err);
     process.exit(1);
   });
-}
-
-// In-memory cache: { [guildId]: { [pageName]: lastContentString } }
-const lastSentContent = {};
-const lastSentContentFile = path.resolve('./lastSentContent.json');
-
-// Load last sent content from file at startup
-try {
-  const data = await fs.readFile(lastSentContentFile, 'utf8');
-  const raw = JSON.parse(data);
-  for (const [guildId, pages] of Object.entries(raw)) {
-    lastSentContent[guildId] = { ...pages };
-  }
-} catch (err) {
-  // silent fail
-}
-
-// Helper: persist last sent content to file
-async function saveLastSentContent() {
-  try {
-    await fs.writeFile(lastSentContentFile, JSON.stringify(lastSentContent, null, 2), 'utf8');
-  } catch (err) {
-    // silent fail
-  }
 }
